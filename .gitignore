@@ -1,0 +1,65 @@
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.ncb
+*.sdf
+*.opensdf
+*.aps
+*.cachefile
+*.VC.db
+*.VC.opendb
+ipch/
+*.aps
+
+# Build outputs
+x64/
+Debug/
+Release/
+obj/
+bin/
+*.obj
+*.o
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+*.exp
+
+# CUDA
+*.ptx
+*.cubin
+
+# NuGet
+*.nupkg
+project.assets.json
+*.nuget.*
+
+# Windows App SDK / WinUI
+*.xbf
+*.pri
+*.pfx
+*.appx
+*.appxupload
+AppxManifest.xml
+AppxBlockMap.xml
+AppxSignature.p7x
+
+# Logs
+*.log
+
+# OS files
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Temp files
+*.tmp
+*.bak
+*.swp
+*~
+
+# Large binary data files (>100MB, GitHub limit)
+dtmb_time_signal.bin
+dtmb_time_signal_triple.bin

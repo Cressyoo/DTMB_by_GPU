@@ -1,0 +1,832 @@
+// dtmb_freq_estimate.cu
+#include "dtmb_freq_estimate.h"
+#include "dtmb_pn420_01_data.h"
+#include <iostream>
+#include <cmath>
+#include <vector>
+#include <cuComplex.h>
+#include <cuda_runtime.h>
+
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) { \
+            fprintf(stderr, "CUDA error in %s at line %d: %s\n", \
+                    __FILE__, __LINE__, cudaGetErrorString(err)); \
+            exit(EXIT_FAILURE); \
+        } \
+    } while(0)
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+static cuFloatComplex* d_pn420_bz_global = NULL;
+static bool pn420_bz_initialized = false;
+
+__constant__ float c_T = 500e-6f / 3780.0f;
+
+void init_pn420_bz_complex() {
+    if (pn420_bz_initialized) {
+        return;
+    }
+    
+    if (d_pn420_bz_global == NULL) {
+        CUDA_CHECK(cudaMalloc(&d_pn420_bz_global, 420 * 225 * sizeof(cuFloatComplex)));
+    }
+    
+    std::vector<cuFloatComplex> h_pn420_bz(420 * 225);
+    for (int row = 0; row < 420; row++) {
+        for (int col = 0; col < 225; col++) {
+            float val = (1.0f - 2.0f * pn420_01[row][col]) / sqrtf(2.0f);
+            h_pn420_bz[row * 225 + col] = make_cuFloatComplex(val, val);
+        }
+    }
+    
+    CUDA_CHECK(cudaMemcpy(d_pn420_bz_global, h_pn420_bz.data(), 
+                          420 * 225 * sizeof(cuFloatComplex), cudaMemcpyHostToDevice));
+    
+    pn420_bz_initialized = true;
+}
+
+int get_sync_type(int frame_n) {
+    int syn_b = 1;
+    
+    if (frame_n <= 110 || frame_n == 225) {
+        if (frame_n % 2 == 0) {
+            syn_b = -1;
+        }
+    } else if (frame_n >= 113 && frame_n <= 223) {
+        if (frame_n % 2 == 1) {
+            syn_b = -1;
+        }
+    } else if (frame_n == 111) {
+        syn_b = 1;
+    } else if (frame_n == 112 || frame_n == 224) {
+        syn_b = 0;
+    }
+    
+    return syn_b;
+}
+
+void get_pn_sequence_params(int syn_b, int& sb0, int& sb1, int& len) {
+    sb0 = 0;
+    sb1 = 0;
+    len = 420;
+    
+    if (syn_b == -1) {
+        sb0 = 1;
+        len = 419;
+    } else if (syn_b == 1) {
+        sb1 = 1;
+        len = 419;
+    }
+}
+
+void calculate_statistics(const std::vector<float>& values, float& mean, float& stddev, float& max_val, float& min_val) {
+    if (values.empty()) {
+        mean = 0.0f;
+        stddev = 0.0f;
+        max_val = 0.0f;
+        min_val = 0.0f;
+        return;
+    }
+    
+    float sum = 0.0f;
+    max_val = values[0];
+    min_val = values[0];
+    
+    for (float val : values) {
+        sum += val;
+        if (val > max_val) max_val = val;
+        if (val < min_val) min_val = val;
+    }
+    
+    mean = sum / values.size();
+    
+    float sum_sq = 0.0f;
+    for (float val : values) {
+        float diff = val - mean;
+        sum_sq += diff * diff;
+    }
+    
+    stddev = sqrtf(sum_sq / values.size());
+}
+
+void calculate_statistics_robust(const std::vector<float>& values, float& mean, float& stddev, float& max_val, float& min_val) {
+    if (values.empty()) {
+        mean = 0.0f;
+        stddev = 0.0f;
+        max_val = 0.0f;
+        min_val = 0.0f;
+        return;
+    }
+    
+    float initial_mean = 0.0f;
+    float initial_std = 0.0f;
+    float initial_max = values[0];
+    float initial_min = values[0];
+    
+    for (float val : values) {
+        initial_mean += val;
+        if (val > initial_max) initial_max = val;
+        if (val < initial_min) initial_min = val;
+    }
+    initial_mean /= values.size();
+    
+    float sum_sq = 0.0f;
+    for (float val : values) {
+        float diff = val - initial_mean;
+        sum_sq += diff * diff;
+    }
+    initial_std = sqrtf(sum_sq / values.size());
+    
+    std::vector<float> filtered_values;
+    float threshold = 3.0f * initial_std;
+    for (float val : values) {
+        if (fabsf(val - initial_mean) <= threshold) {
+            filtered_values.push_back(val);
+        }
+    }
+    
+    if (filtered_values.empty()) {
+        mean = initial_mean;
+        stddev = initial_std;
+        max_val = initial_max;
+        min_val = initial_min;
+        return;
+    }
+    
+    float sum = 0.0f;
+    max_val = filtered_values[0];
+    min_val = filtered_values[0];
+    
+    for (float val : filtered_values) {
+        sum += val;
+        if (val > max_val) max_val = val;
+        if (val < min_val) min_val = val;
+    }
+    
+    mean = sum / filtered_values.size();
+    
+    sum_sq = 0.0f;
+    for (float val : filtered_values) {
+        float diff = val - mean;
+        sum_sq += diff * diff;
+    }
+    
+    stddev = sqrtf(sum_sq / filtered_values.size());
+}
+
+FreqEstimateResult dtmb_freq_estimate(
+    const std::vector<std::complex<float>>& data,
+    int frame_syn,
+    int cnt
+) {
+    FreqEstimateResult result;
+    result.freq_delta = 0.0f;
+    result.freq_delta_std = 0.0f;
+    result.freq_delta_max = 0.0f;
+    result.freq_delta_min = 0.0f;
+    result.freq_delta1 = 0.0f;
+    result.freq_delta1_std = 0.0f;
+    result.freq_delta1_max = 0.0f;
+    result.freq_delta1_min = 0.0f;
+    result.freq_delta_v.resize(cnt, 0.0f);
+    result.freq_delta_v1.resize(cnt, 0.0f);
+    
+    const float Tu = 500e-6f;
+    const float T = Tu / 3780.0f;
+    const int frame_size = 4200;
+    const int use_points = 156;
+    
+    std::vector<std::complex<float>> pn420_bz(420 * 225);
+    for (int row = 0; row < 420; row++) {
+        for (int col = 0; col < 225; col++) {
+            float val = (1.0f - 2.0f * pn420_01[row][col]) / sqrtf(2.0f);
+            pn420_bz[row * 225 + col] = std::complex<float>(val, val);
+        }
+    }
+    
+    for (int m = 0; m < cnt; m++) {
+        int frame_n = frame_syn + m;
+        int frame_n2 = frame_syn + m + 2;
+        
+        if (frame_n > 225) frame_n -= 225;
+        if (frame_n2 > 225) frame_n2 -= 225;
+        
+        int syn_b = get_sync_type(frame_n);
+        
+        int sb0, sb1, len;
+        get_pn_sequence_params(syn_b, sb0, sb1, len);
+        
+        std::vector<std::complex<float>> y_1(len);
+        std::vector<std::complex<float>> y_2(len);
+        
+        for (int i = 0; i < len; i++) {
+            int y1_idx = frame_size * m + sb0 + i;
+            int y2_idx = frame_size * (m + 2) + sb1 + i;
+            
+            y_1[i] = data[y1_idx];
+            y_2[i] = data[y2_idx];
+        }
+        
+        std::complex<float> rf1(0.0f, 0.0f);
+        for (int i = 0; i < len; i++) {
+            std::complex<float> pn_f1 = pn420_bz[(sb0 + i) * 225 + (frame_n - 1)];
+            std::complex<float> pn_f2 = pn420_bz[(sb1 + i) * 225 + (frame_n2 - 1)];
+            
+            std::complex<float> z1 = y_1[i] * std::conj(pn_f1);
+            std::complex<float> z2 = y_2[i] * std::conj(pn_f2);
+            rf1 += z2 * std::conj(z1);
+        }
+        
+        int syn_L = frame_size * 2 + syn_b;
+        float angle_rf1 = std::arg(rf1);
+        result.freq_delta_v[m] = -angle_rf1 / (2.0f * (float)M_PI * syn_L * T);
+        
+        int start_idx = len - use_points;
+        std::complex<float> rf1_short(0.0f, 0.0f);
+        for (int i = start_idx; i < len; i++) {
+            std::complex<float> pn_f1 = pn420_bz[(sb0 + i) * 225 + (frame_n - 1)];
+            std::complex<float> pn_f2 = pn420_bz[(sb1 + i) * 225 + (frame_n2 - 1)];
+            
+            std::complex<float> z1 = y_1[i] * std::conj(pn_f1);
+            std::complex<float> z2 = y_2[i] * std::conj(pn_f2);
+            rf1_short += z2 * std::conj(z1);
+        }
+        
+        float angle_rf1_short = std::arg(rf1_short);
+        result.freq_delta_v1[m] = -angle_rf1_short / (2.0f * (float)M_PI * syn_L * T);
+    }
+    
+    calculate_statistics_robust(result.freq_delta_v, result.freq_delta, result.freq_delta_std, 
+                        result.freq_delta_max, result.freq_delta_min);
+    calculate_statistics_robust(result.freq_delta_v1, result.freq_delta1, result.freq_delta1_std, 
+                        result.freq_delta1_max, result.freq_delta1_min);
+    
+    return result;
+}
+
+__global__ void compute_correlation_kernel(
+    const cuFloatComplex* __restrict__ d_data,
+    const cuFloatComplex* __restrict__ d_pn420_bz,
+    float* d_freq_delta_v,
+    float* d_freq_delta_v1,
+    int frame_syn,
+    int cnt,
+    int frame_size
+) {
+    int m = blockIdx.x;
+    
+    if (m >= cnt) return;
+    
+    int frame_n = frame_syn + m;
+    int frame_n2 = frame_syn + m + 2;
+    
+    if (frame_n > 225) frame_n -= 225;
+    if (frame_n2 > 225) frame_n2 -= 225;
+    
+    int syn_b = 1;
+    if (frame_n <= 110 || frame_n == 225) {
+        if (frame_n % 2 == 0) syn_b = -1;
+    } else if (frame_n >= 113 && frame_n <= 223) {
+        if (frame_n % 2 == 1) syn_b = -1;
+    } else if (frame_n == 111) {
+        syn_b = 1;
+    } else if (frame_n == 112 || frame_n == 224) {
+        syn_b = 0;
+    }
+    
+    int sb0 = 0, sb1 = 0, len = 420;
+    if (syn_b == -1) {
+        sb0 = 1;
+        len = 419;
+    } else if (syn_b == 1) {
+        sb1 = 1;
+        len = 419;
+    }
+    
+    const int use_points = 156;
+    int start_idx = len - use_points;
+    
+    __shared__ cuFloatComplex sh_sum[256];
+    __shared__ cuFloatComplex sh_sum_short[256];
+    
+    sh_sum[threadIdx.x] = make_cuFloatComplex(0.0f, 0.0f);
+    sh_sum_short[threadIdx.x] = make_cuFloatComplex(0.0f, 0.0f);
+    __syncthreads();
+    
+    for (int i = threadIdx.x; i < len; i += 256) {
+        int y1_idx = frame_size * m + sb0 + i;
+        int y2_idx = frame_size * (m + 2) + sb1 + i;
+        
+        cuFloatComplex y1 = d_data[y1_idx];
+        cuFloatComplex y2 = d_data[y2_idx];
+        
+        cuFloatComplex pn_f1 = d_pn420_bz[(sb0 + i) * 225 + (frame_n - 1)];
+        cuFloatComplex pn_f2 = d_pn420_bz[(sb1 + i) * 225 + (frame_n2 - 1)];
+        
+        cuFloatComplex conj_pn_f1 = make_cuFloatComplex(cuCrealf(pn_f1), -cuCimagf(pn_f1));
+        cuFloatComplex conj_pn_f2 = make_cuFloatComplex(cuCrealf(pn_f2), -cuCimagf(pn_f2));
+        
+        cuFloatComplex z1 = cuCmulf(y1, conj_pn_f1);
+        cuFloatComplex z2 = cuCmulf(y2, conj_pn_f2);
+        
+        cuFloatComplex conj_z1 = make_cuFloatComplex(cuCrealf(z1), -cuCimagf(z1));
+        cuFloatComplex term = cuCmulf(z2, conj_z1);
+        
+        sh_sum[threadIdx.x] = cuCaddf(sh_sum[threadIdx.x], term);
+        
+        if (i >= start_idx) {
+            sh_sum_short[threadIdx.x] = cuCaddf(sh_sum_short[threadIdx.x], term);
+        }
+    }
+    __syncthreads();
+    
+    for (int s = 128; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            sh_sum[threadIdx.x] = cuCaddf(sh_sum[threadIdx.x], sh_sum[threadIdx.x + s]);
+            sh_sum_short[threadIdx.x] = cuCaddf(sh_sum_short[threadIdx.x], sh_sum_short[threadIdx.x + s]);
+        }
+        __syncthreads();
+    }
+    
+    if (threadIdx.x == 0) {
+        cuFloatComplex rf1 = sh_sum[0];
+        float angle_rf1 = atan2f(cuCimagf(rf1), cuCrealf(rf1));
+        int syn_L = frame_size * 2 + syn_b;
+        float freq = -angle_rf1 / (2.0f * 3.14159265358979323846f * syn_L * c_T);
+        
+        d_freq_delta_v[m] = freq;
+        
+        cuFloatComplex rf1_short = sh_sum_short[0];
+        float angle_rf1_short = atan2f(cuCimagf(rf1_short), cuCrealf(rf1_short));
+        float freq1 = -angle_rf1_short / (2.0f * 3.14159265358979323846f * syn_L * c_T);
+        
+        d_freq_delta_v1[m] = freq1;
+    }
+}
+
+FreqEstimateResult dtmb_freq_estimate_gpu(
+    const std::vector<std::complex<float>>& data,
+    int frame_syn,
+    int cnt,
+    FreqEstimateGPUCache* cache
+) {
+    FreqEstimateResult result;
+    result.freq_delta = 0.0f;
+    result.freq_delta_std = 0.0f;
+    result.freq_delta_max = 0.0f;
+    result.freq_delta_min = 0.0f;
+    result.freq_delta1 = 0.0f;
+    result.freq_delta1_std = 0.0f;
+    result.freq_delta1_max = 0.0f;
+    result.freq_delta1_min = 0.0f;
+    result.freq_delta_v.resize(cnt, 0.0f);
+    result.freq_delta_v1.resize(cnt, 0.0f);
+    
+    if (!cache || !cache->is_valid) {
+        return result;
+    }
+    
+    init_pn420_bz_complex();
+    
+    const int frame_size = 4200;
+    int data_size = (cnt + 2) * frame_size;
+    int max_data_size = (cache->max_frame_count + 2) * frame_size;
+    
+    if (data_size > max_data_size) {
+        std::cerr << "Error: data_size (" << data_size << ") exceeds max_data_size (" << max_data_size << ")" << std::endl;
+        return result;
+    }
+    
+    int copy_size = std::min(data_size, (int)data.size());
+    std::vector<cuFloatComplex> h_data(data_size);
+    for (int i = 0; i < copy_size; i++) {
+        h_data[i] = make_cuFloatComplex(data[i].real(), data[i].imag());
+    }
+    
+    CUDA_CHECK(cudaMemcpy(cache->d_data, h_data.data(), 
+                          data_size * sizeof(cuFloatComplex), cudaMemcpyHostToDevice));
+    
+    compute_correlation_kernel<<<cnt, 256>>>(
+        cache->d_data,
+        cache->d_pn420_bz,
+        cache->d_freq_delta_v,
+        cache->d_freq_delta_v1,
+        frame_syn,
+        cnt,
+        frame_size
+    );
+    CUDA_CHECK(cudaGetLastError());
+    
+    std::vector<float> h_freq_delta_v(cnt);
+    std::vector<float> h_freq_delta_v1(cnt);
+    CUDA_CHECK(cudaMemcpy(h_freq_delta_v.data(), cache->d_freq_delta_v, 
+                          cnt * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_freq_delta_v1.data(), cache->d_freq_delta_v1, 
+                          cnt * sizeof(float), cudaMemcpyDeviceToHost));
+    
+    result.freq_delta_v = h_freq_delta_v;
+    result.freq_delta_v1 = h_freq_delta_v1;
+    
+    calculate_statistics_robust(result.freq_delta_v, result.freq_delta, result.freq_delta_std, 
+                        result.freq_delta_max, result.freq_delta_min);
+    calculate_statistics_robust(result.freq_delta_v1, result.freq_delta1, result.freq_delta1_std, 
+                        result.freq_delta1_max, result.freq_delta1_min);
+    
+    return result;
+}
+
+FreqEstimateResult dtmb_freq_estimate_gpu_device(
+    const cufftComplex* d_data,
+    int data_size,
+    int frame_syn,
+    int cnt,
+    FreqEstimateGPUCache* cache
+) {
+    FreqEstimateResult result;
+    result.freq_delta = 0.0f;
+    result.freq_delta_std = 0.0f;
+    result.freq_delta_max = 0.0f;
+    result.freq_delta_min = 0.0f;
+    result.freq_delta1 = 0.0f;
+    result.freq_delta1_std = 0.0f;
+    result.freq_delta1_max = 0.0f;
+    result.freq_delta1_min = 0.0f;
+    result.freq_delta_v.resize(cnt, 0.0f);
+    result.freq_delta_v1.resize(cnt, 0.0f);
+    
+    // 增加参数检查
+    if (!cache || !cache->is_valid || d_data == nullptr || data_size <= 0 || 
+        frame_syn < 1 || frame_syn > 225 || cnt <= 0) {
+        return result;
+    }
+    
+    init_pn420_bz_complex();
+    
+    const int frame_size = 4200;
+    int data_needed = (cnt + 1) * frame_size;
+    
+    if (data_size < data_needed) {
+        return result;
+    }
+    
+    int max_cache_size = (cache->max_frame_count + 2) * frame_size;
+    int copy_size = data_needed;
+    if (copy_size > max_cache_size) {
+        copy_size = max_cache_size;
+    }
+    if (copy_size > data_size) {
+        copy_size = data_size;
+    }
+    
+    CUDA_CHECK(cudaMemcpyAsync(cache->d_data, d_data, 
+                          copy_size * sizeof(cufftComplex), cudaMemcpyDeviceToDevice));
+    
+    compute_correlation_kernel<<<cnt, 256>>>(
+        cache->d_data,
+        cache->d_pn420_bz,
+        cache->d_freq_delta_v,
+        cache->d_freq_delta_v1,
+        frame_syn,
+        cnt,
+        frame_size
+    );
+    CUDA_CHECK(cudaGetLastError());
+    
+    std::vector<float> h_freq_delta_v(cnt);
+    std::vector<float> h_freq_delta_v1(cnt);
+    CUDA_CHECK(cudaMemcpy(h_freq_delta_v.data(), cache->d_freq_delta_v, 
+                          cnt * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_freq_delta_v1.data(), cache->d_freq_delta_v1, 
+                          cnt * sizeof(float), cudaMemcpyDeviceToHost));
+    
+    result.freq_delta_v = h_freq_delta_v;
+    result.freq_delta_v1 = h_freq_delta_v1;
+    
+    calculate_statistics_robust(result.freq_delta_v, result.freq_delta, result.freq_delta_std, 
+                        result.freq_delta_max, result.freq_delta_min);
+    calculate_statistics_robust(result.freq_delta_v1, result.freq_delta1, result.freq_delta1_std, 
+                        result.freq_delta1_max, result.freq_delta1_min);
+    
+    return result;
+}
+
+FreqEstimateGPUCache* create_freq_estimate_gpu_cache(int max_frame_count) {
+    FreqEstimateGPUCache* cache = (FreqEstimateGPUCache*)malloc(sizeof(FreqEstimateGPUCache));
+    if (!cache) {
+        return NULL;
+    }
+    
+    cache->max_frame_count = max_frame_count;
+    cache->is_valid = false;
+    
+    int max_data_size = (max_frame_count + 2) * 4200;
+    
+    CUDA_CHECK(cudaMalloc(&cache->d_data, max_data_size * sizeof(cuFloatComplex)));
+    CUDA_CHECK(cudaMalloc(&cache->d_z1, max_frame_count * 420 * sizeof(cuFloatComplex)));
+    CUDA_CHECK(cudaMalloc(&cache->d_z2, max_frame_count * 420 * sizeof(cuFloatComplex)));
+    CUDA_CHECK(cudaMalloc(&cache->d_freq_delta_v, max_frame_count * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&cache->d_freq_delta_v1, max_frame_count * sizeof(float)));
+    
+    init_pn420_bz_complex();
+    cache->d_pn420_bz = d_pn420_bz_global;
+    
+    cache->is_valid = true;
+    return cache;
+}
+
+void destroy_freq_estimate_gpu_cache(FreqEstimateGPUCache* cache) {
+    if (!cache) {
+        return;
+    }
+    if (cache->is_valid) {
+        CUDA_CHECK(cudaFree(cache->d_data));
+        CUDA_CHECK(cudaFree(cache->d_z1));
+        CUDA_CHECK(cudaFree(cache->d_z2));
+        CUDA_CHECK(cudaFree(cache->d_freq_delta_v));
+        CUDA_CHECK(cudaFree(cache->d_freq_delta_v1));
+    }
+    free(cache);
+}
+
+// ==================== GPU频率补偿实现 ====================
+
+__global__ void freq_compensate_kernel(
+    const cuFloatComplex* __restrict__ d_input,
+    cuFloatComplex* __restrict__ d_output,
+    float freq_delta,
+    float sample_rate,
+    int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float phase = 2.0f * 3.14159265358979323846f * freq_delta * idx / sample_rate;
+        float sin_p, cos_p;
+        __sincosf(phase, &sin_p, &cos_p);
+        
+        cuFloatComplex val = d_input[idx];
+        d_output[idx] = make_cuFloatComplex(
+            cuCrealf(val) * cos_p - cuCimagf(val) * sin_p,
+            cuCrealf(val) * sin_p + cuCimagf(val) * cos_p
+        );
+    }
+}
+
+__global__ void freq_compensate_inplace_kernel(
+    cuFloatComplex* __restrict__ d_data,
+    float freq_delta,
+    float sample_rate,
+    int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float phase = 2.0f * 3.14159265358979323846f * freq_delta * idx / sample_rate;
+        float sin_p, cos_p;
+        __sincosf(phase, &sin_p, &cos_p);
+        
+        cuFloatComplex val = d_data[idx];
+        d_data[idx] = make_cuFloatComplex(
+            cuCrealf(val) * cos_p - cuCimagf(val) * sin_p,
+            cuCrealf(val) * sin_p + cuCimagf(val) * cos_p
+        );
+    }
+}
+
+FreqCompensateGPUCache* create_freq_compensate_gpu_cache(int max_len) {
+    FreqCompensateGPUCache* cache = (FreqCompensateGPUCache*)malloc(sizeof(FreqCompensateGPUCache));
+    if (!cache) {
+        return NULL;
+    }
+    
+    cache->max_len = max_len;
+    cache->is_valid = false;
+    
+    CUDA_CHECK(cudaMalloc(&cache->d_input, max_len * sizeof(cuFloatComplex)));
+    CUDA_CHECK(cudaMalloc(&cache->d_output, max_len * sizeof(cuFloatComplex)));
+    
+    cache->is_valid = true;
+    return cache;
+}
+
+void destroy_freq_compensate_gpu_cache(FreqCompensateGPUCache* cache) {
+    if (!cache) {
+        return;
+    }
+    if (cache->is_valid) {
+        CUDA_CHECK(cudaFree(cache->d_input));
+        CUDA_CHECK(cudaFree(cache->d_output));
+    }
+    free(cache);
+}
+
+std::vector<std::complex<float>> freq_compensate_gpu(
+    const std::vector<std::complex<float>>& data,
+    float freq_delta,
+    float sample_rate,
+    FreqCompensateGPUCache* cache)
+{
+    int n = (int)data.size();
+    std::vector<std::complex<float>> result(n);
+    
+    if (!cache || !cache->is_valid || n > cache->max_len) {
+        return result;
+    }
+    
+    std::vector<cuFloatComplex> host_data(n);
+    for (int i = 0; i < n; i++) {
+        host_data[i] = make_cuFloatComplex(data[i].real(), data[i].imag());
+    }
+    
+    CUDA_CHECK(cudaMemcpy(cache->d_input, host_data.data(), n * sizeof(cuFloatComplex), cudaMemcpyHostToDevice));
+    
+    int blockSize = 256;
+    int gridSize = (n + blockSize - 1) / blockSize;
+    freq_compensate_kernel<<<gridSize, blockSize>>>(cache->d_input, cache->d_output, freq_delta, sample_rate, n);
+    CUDA_CHECK(cudaGetLastError());
+    
+    std::vector<cuFloatComplex> host_result(n);
+    CUDA_CHECK(cudaMemcpy(host_result.data(), cache->d_output, n * sizeof(cuFloatComplex), cudaMemcpyDeviceToHost));
+    
+    for (int i = 0; i < n; i++) {
+        result[i] = std::complex<float>(cuCrealf(host_result[i]), cuCimagf(host_result[i]));
+    }
+    
+    return result;
+}
+
+void freq_compensate_gpu_inplace(
+    cuFloatComplex* d_data,
+    float freq_delta,
+    float sample_rate,
+    int n)
+{
+    int blockSize = 256;
+    int gridSize = (n + blockSize - 1) / blockSize;
+    freq_compensate_inplace_kernel<<<gridSize, blockSize>>>(d_data, freq_delta, sample_rate, n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+__global__ void freq_compensate_dual_channel_kernel(
+    const cuFloatComplex* __restrict__ d_input,
+    cuFloatComplex* __restrict__ d_output,
+    float freq_delta,
+    float sample_rate,
+    int samples_per_channel)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_samples = 2 * samples_per_channel;
+    if (idx < total_samples) {
+        int channel = idx / samples_per_channel;
+        int sample_in_channel = idx % samples_per_channel;
+        
+        float phase = 2.0f * 3.14159265358979323846f * freq_delta * sample_in_channel / sample_rate;
+        float sin_p, cos_p;
+        __sincosf(phase, &sin_p, &cos_p);
+        
+        cuFloatComplex val = d_input[idx];
+        d_output[idx] = make_cuFloatComplex(
+            cuCrealf(val) * cos_p - cuCimagf(val) * sin_p,
+            cuCrealf(val) * sin_p + cuCimagf(val) * cos_p
+        );
+    }
+}
+
+std::vector<std::complex<float>> freq_compensate_gpu_dual_channel(
+    const std::vector<std::complex<float>>& data,
+    float freq_delta,
+    float sample_rate,
+    FreqCompensateGPUCache* cache)
+{
+    int n = (int)data.size();
+    int samples_per_channel = n / 2;
+    std::vector<std::complex<float>> result(n);
+    
+    if (!cache || !cache->is_valid || n > cache->max_len) {
+        return result;
+    }
+    
+    std::vector<cuFloatComplex> host_data(n);
+    for (int i = 0; i < n; i++) {
+        host_data[i] = make_cuFloatComplex(data[i].real(), data[i].imag());
+    }
+    
+    CUDA_CHECK(cudaMemcpy(cache->d_input, host_data.data(), n * sizeof(cuFloatComplex), cudaMemcpyHostToDevice));
+    
+    int blockSize = 256;
+    int gridSize = (n + blockSize - 1) / blockSize;
+    freq_compensate_dual_channel_kernel<<<gridSize, blockSize>>>(cache->d_input, cache->d_output, freq_delta, sample_rate, samples_per_channel);
+    CUDA_CHECK(cudaGetLastError());
+    
+    std::vector<cuFloatComplex> host_result(n);
+    CUDA_CHECK(cudaMemcpy(host_result.data(), cache->d_output, n * sizeof(cuFloatComplex), cudaMemcpyDeviceToHost));
+    
+    for (int i = 0; i < n; i++) {
+        result[i] = std::complex<float>(cuCrealf(host_result[i]), cuCimagf(host_result[i]));
+    }
+    
+    return result;
+}
+
+__global__ void freq_compensate_dual_channel_inplace_kernel(
+    cufftComplex* d_data,
+    float freq_delta,
+    float sample_rate,
+    int samples_per_channel)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_samples = 2 * samples_per_channel;
+    if (idx < total_samples) {
+        int sample_in_channel = idx % samples_per_channel;
+        
+        float phase = 2.0f * 3.14159265358979323846f * freq_delta * sample_in_channel / sample_rate;
+        float sin_p, cos_p;
+        __sincosf(phase, &sin_p, &cos_p);
+        
+        cufftComplex val = d_data[idx];
+        d_data[idx].x = val.x * cos_p - val.y * sin_p;
+        d_data[idx].y = val.x * sin_p + val.y * cos_p;
+    }
+}
+
+__global__ void freq_compensate_multi_channel_inplace_kernel(
+    cufftComplex* d_data,
+    float freq_delta,
+    float sample_rate,
+    int num_channels,
+    int samples_per_channel)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_samples = num_channels * samples_per_channel;
+    if (idx < total_samples) {
+        int sample_in_channel = idx % samples_per_channel;
+        
+        float phase = 2.0f * 3.14159265358979323846f * freq_delta * sample_in_channel / sample_rate;
+        float sin_p, cos_p;
+        __sincosf(phase, &sin_p, &cos_p);
+        
+        cufftComplex val = d_data[idx];
+        d_data[idx].x = val.x * cos_p - val.y * sin_p;
+        d_data[idx].y = val.x * sin_p + val.y * cos_p;
+    }
+}
+
+void freq_compensate_gpu_dual_channel_inplace(
+    cufftComplex* d_data,
+    float freq_delta,
+    float sample_rate,
+    int samples_per_channel)
+{
+    int total_samples = 2 * samples_per_channel;
+    int blockSize = 256;
+    int gridSize = (total_samples + blockSize - 1) / blockSize;
+    freq_compensate_dual_channel_inplace_kernel<<<gridSize, blockSize>>>(d_data, freq_delta, sample_rate, samples_per_channel);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void freq_compensate_gpu_multi_channel_inplace(
+    cufftComplex* d_data,
+    float freq_delta,
+    float sample_rate,
+    int num_channels,
+    int samples_per_channel)
+{
+    int total_samples = num_channels * samples_per_channel;
+    int blockSize = 256;
+    int gridSize = (total_samples + blockSize - 1) / blockSize;
+    freq_compensate_multi_channel_inplace_kernel<<<gridSize, blockSize>>>(d_data, freq_delta, sample_rate, num_channels, samples_per_channel);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+std::vector<std::complex<float>> freq_compensate_gpu_dual_channel_from_cufft(
+    cufftComplex* h_data,
+    int total_samples,
+    float freq_delta,
+    float sample_rate,
+    FreqCompensateGPUCache* cache)
+{
+    int samples_per_channel = total_samples / 2;
+    std::vector<std::complex<float>> result(total_samples);
+    
+    if (!cache || !cache->is_valid || total_samples > cache->max_len) {
+        return result;
+    }
+    
+    CUDA_CHECK(cudaMemcpy(cache->d_input, h_data, total_samples * sizeof(cufftComplex), cudaMemcpyHostToDevice));
+    
+    int blockSize = 256;
+    int gridSize = (total_samples + blockSize - 1) / blockSize;
+    freq_compensate_dual_channel_kernel<<<gridSize, blockSize>>>(cache->d_input, cache->d_output, freq_delta, sample_rate, samples_per_channel);
+    CUDA_CHECK(cudaGetLastError());
+    
+    std::vector<cufftComplex> host_result(total_samples);
+    CUDA_CHECK(cudaMemcpy(host_result.data(), cache->d_output, total_samples * sizeof(cufftComplex), cudaMemcpyDeviceToHost));
+    
+    for (int i = 0; i < total_samples; i++) {
+        result[i] = std::complex<float>(host_result[i].x, host_result[i].y);
+    }
+    
+    return result;
+}

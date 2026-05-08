@@ -1,0 +1,141 @@
+<Window
+    x:Class="DTMB_Sender_GUI.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="DTMB Signal Sender">
+
+    <Grid Padding="24" RowSpacing="12" ColumnSpacing="12">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="Auto"/>
+            <ColumnDefinition Width="*"/>
+            <ColumnDefinition Width="Auto"/>
+        </Grid.ColumnDefinitions>
+
+        <!-- Title -->
+        <TextBlock Grid.Row="0" Grid.Column="0" Grid.ColumnSpan="3"
+                   Text="DTMB Signal Sender"
+                   Style="{StaticResource TitleTextBlockStyle}"
+                   Margin="0,0,0,8"/>
+
+        <!-- Data Mode -->
+        <TextBlock Grid.Row="1" Grid.Column="0"
+                   Text="Data Mode:" VerticalAlignment="Center" Margin="0,0,12,0"/>
+        <RadioButtons Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="2"
+                      x:Name="ModeRadioButtons"
+                      SelectedIndex="1"
+                      SelectionChanged="ModeRadioButtons_SelectionChanged">
+            <RadioButton x:Name="RadioSimMode" Content="Simulation Data (3-ch .bin)" Tag="sim"/>
+            <RadioButton x:Name="RadioRealMode" Content="Measured Data (3-ch, 10MHz)" Tag="real"/>
+        </RadioButtons>
+
+        <!-- Simulation File -->
+        <TextBlock Grid.Row="2" Grid.Column="0"
+                   Text="Sim File:" VerticalAlignment="Center" Margin="0,0,12,0"/>
+        <TextBox Grid.Row="2" Grid.Column="1"
+                 x:Name="SimFilePathBox"
+                 Text="D:/CUDA_Program/DTMB_process/DTMB_Sender_GUI/dtmb_time_signal_triple.bin"
+                 IsEnabled="False" PlaceholderText="Select simulation data file..."/>
+        <Button Grid.Row="2" Grid.Column="2"
+                x:Name="BrowseSimBtn" Content="Browse..."
+                Click="BrowseSimBtn_Click" Margin="12,0,0,0" MinWidth="100" IsEnabled="False"/>
+
+        <!-- Measured File -->
+        <TextBlock Grid.Row="3" Grid.Column="0"
+                   Text="Meas File:" VerticalAlignment="Center" Margin="0,0,12,0"/>
+        <TextBox Grid.Row="3" Grid.Column="1"
+                 x:Name="RealFilePathBox"
+                 Text="D:/CUDA_Program/testdata.bin"
+                 IsReadOnly="False" PlaceholderText="Select measured data file..."/>
+        <Button Grid.Row="3" Grid.Column="2"
+                x:Name="BrowseRealBtn" Content="Browse..."
+                Click="BrowseRealBtn_Click" Margin="12,0,0,0" MinWidth="100"/>
+
+        <!-- Channel Selection -->
+        <TextBlock Grid.Row="4" Grid.Column="0"
+                   Text="Channels:" VerticalAlignment="Center" Margin="0,0,12,0"/>
+        <StackPanel Grid.Row="4" Grid.Column="1" Grid.ColumnSpan="2" Orientation="Horizontal" Spacing="16">
+            <StackPanel Orientation="Horizontal" Spacing="4">
+                <TextBlock Text="Ref:" VerticalAlignment="Center"/>
+                <ComboBox x:Name="RefChCombo" SelectedIndex="0" MinWidth="70">
+                    <ComboBoxItem Content="Ch0"/>
+                    <ComboBoxItem Content="Ch1"/>
+                    <ComboBoxItem Content="Ch2"/>
+                    <ComboBoxItem Content="Ch3"/>
+                    <ComboBoxItem Content="Ch4"/>
+                    <ComboBoxItem Content="Ch5"/>
+                    <ComboBoxItem Content="Ch6"/>
+                    <ComboBoxItem Content="Ch7"/>
+                </ComboBox>
+            </StackPanel>
+            <StackPanel Orientation="Horizontal" Spacing="4">
+                <TextBlock Text="Sur1:" VerticalAlignment="Center"/>
+                <ComboBox x:Name="Sur1ChCombo" SelectedIndex="1" MinWidth="70">
+                    <ComboBoxItem Content="Ch0"/>
+                    <ComboBoxItem Content="Ch1"/>
+                    <ComboBoxItem Content="Ch2"/>
+                    <ComboBoxItem Content="Ch3"/>
+                    <ComboBoxItem Content="Ch4"/>
+                    <ComboBoxItem Content="Ch5"/>
+                    <ComboBoxItem Content="Ch6"/>
+                    <ComboBoxItem Content="Ch7"/>
+                </ComboBox>
+            </StackPanel>
+            <StackPanel Orientation="Horizontal" Spacing="4">
+                <TextBlock Text="Sur2:" VerticalAlignment="Center"/>
+                <ComboBox x:Name="Sur2ChCombo" SelectedIndex="2" MinWidth="70">
+                    <ComboBoxItem Content="Ch0"/>
+                    <ComboBoxItem Content="Ch1"/>
+                    <ComboBoxItem Content="Ch2"/>
+                    <ComboBoxItem Content="Ch3"/>
+                    <ComboBoxItem Content="Ch4"/>
+                    <ComboBoxItem Content="Ch5"/>
+                    <ComboBoxItem Content="Ch6"/>
+                    <ComboBoxItem Content="Ch7"/>
+                </ComboBox>
+            </StackPanel>
+        </StackPanel>
+
+        <!-- Control Buttons -->
+        <StackPanel Grid.Row="5" Grid.Column="0" Grid.ColumnSpan="3" Orientation="Horizontal" Spacing="12" Margin="0,4,0,0">
+            <Button x:Name="StartBtn" Content="Start" Click="StartBtn_Click"
+                    Style="{StaticResource AccentButtonStyle}" MinWidth="120" MinHeight="36"/>
+            <Button x:Name="StopBtn" Content="Stop" Click="StopBtn_Click"
+                    IsEnabled="False" MinWidth="120" MinHeight="36"/>
+            <CheckBox x:Name="LoopCheckBox" Content="Loop Playback" IsChecked="True" VerticalAlignment="Center" Margin="16,0,0,0"
+                      Checked="LoopCheckBox_Checked" Unchecked="LoopCheckBox_Unchecked"/>
+        </StackPanel>
+
+        <!-- Status -->
+        <InfoBar Grid.Row="6" Grid.Column="0" Grid.ColumnSpan="3"
+                 x:Name="StatusInfoBar"
+                 IsOpen="True" IsClosable="False"
+                 Severity="Informational"
+                 Title="Status" Message="Ready. Select a data file and click Start."/>
+
+        <!-- Log -->
+        <TextBlock Grid.Row="7" Grid.Column="0"
+                   Text="Log:" VerticalAlignment="Top" Margin="0,4,12,0"/>
+        <ScrollViewer Grid.Row="7" Grid.Column="1" Grid.ColumnSpan="2" VerticalScrollBarVisibility="Auto">
+            <TextBox x:Name="LogTextBox"
+                     IsReadOnly="True" TextWrapping="Wrap"
+                     AcceptsReturn="True"
+                     Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                     BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"/>
+        </ScrollViewer>
+
+        <!-- Progress -->
+        <ProgressBar Grid.Row="8" Grid.Column="0" Grid.ColumnSpan="3"
+                     x:Name="Progressbar" IsIndeterminate="False" Value="0" Maximum="100" Margin="0,4,0,0"/>
+    </Grid>
+</Window>
